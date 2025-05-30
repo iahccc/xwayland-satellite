@@ -464,7 +464,6 @@ impl HandleEvent for Pointer {
                 };
 
                 self.scale = surface_data.scale_factor;
-                let surface_is_popup = matches!(surface_data.role, Some(SurfaceRole::Popup(_)));
                 let mut do_enter = || {
                     debug!("pointer entering {} ({serial})", surface_data.server.id());
                     self.server.enter(
@@ -475,12 +474,10 @@ impl HandleEvent for Pointer {
                     );
                     let window = surface_data.window.unwrap();
                     state.connection.as_mut().unwrap().raise_to_top(window);
-                    if !surface_is_popup {
-                        state.last_hovered = Some(window);
-                    }
+                    state.last_hovered = Some(window);
                 };
 
-                if surface_is_popup {
+                if matches!(surface_data.role, Some(SurfaceRole::Popup(_))) {
                     match self.pending_enter.0.take() {
                         Some(e) => {
                             let client::wl_pointer::Event::Enter {
