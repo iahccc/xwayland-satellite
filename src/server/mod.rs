@@ -173,6 +173,32 @@ struct SurfaceAttach {
     y: i32,
 }
 
+#[derive(Debug, Copy, Clone)]
+struct BufferDimensions {
+    width: i32,
+    height: i32,
+}
+
+#[derive(Debug, Copy, Clone)]
+struct AttachedBufferDimensions(Option<BufferDimensions>);
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+enum CursorOwner {
+    Pointer(Entity),
+    TabletTool(Entity),
+}
+
+#[derive(Debug, Copy, Clone)]
+struct CursorState {
+    surface: Option<Entity>,
+    serial: u32,
+    hotspot_x: i32,
+    hotspot_y: i32,
+}
+
+#[derive(Debug, Copy, Clone)]
+struct CursorSurfaceOwner(CursorOwner);
+
 #[derive(PartialEq, Eq, Debug)]
 struct SurfaceSerial([u32; 2]);
 

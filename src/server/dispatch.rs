@@ -65,6 +65,180 @@ use wayland_server::{
     },
 };
 
+fn cursor_state<S: X11Selection>(
+    state: &InnerServerState<S>,
+    owner: CursorOwner,
+) -> Option<CursorState> {
+    let entity = match owner {
+        CursorOwner::Pointer(entity) | CursorOwner::TabletTool(entity) => entity,
+    };
+    state
+        .world
+        .get::<&CursorState>(entity)
+        .ok()
+        .map(|state| *state)
+}
+
+fn set_cursor_state<S: X11Selection>(
+    state: &mut InnerServerState<S>,
+    owner: CursorOwner,
+    surface: Option<Entity>,
+    serial: u32,
+    hotspot_x: i32,
+    hotspot_y: i32,
+) {
+    let entity = match owner {
+        CursorOwner::Pointer(entity) | CursorOwner::TabletTool(entity) => entity,
+    };
+
+    let previous_surface = state
+        .world
+        .get::<&CursorState>(entity)
+        .ok()
+        .and_then(|state| state.surface);
+
+    if let Some(previous_surface) = previous_surface.filter(|previous| Some(*previous) != surface) {
+        let _ = state.world.remove_one::<CursorSurfaceOwner>(previous_surface);
+    }
+
+    let _ = state.world.insert_one(
+        entity,
+        CursorState {
+            surface,
+            serial,
+            hotspot_x,
+            hotspot_y,
+        },
+    );
+
+    if let Some(surface) = surface {
+        let _ = state.world.insert_one(surface, CursorSurfaceOwner(owner));
+    }
+}
+
+const DEFAULT_CURSOR_BASE_SIZE: i32 = 24;
+
+fn desired_cursor_buffer_scale<S: X11Selection>(
+    state: &InnerServerState<S>,
+    surface_entity: Entity,
+) -> (i32, Option<BufferDimensions>) {
+    let surface_scale = state
+        .world
+        .get::<&SurfaceScaleFactor>(surface_entity)
+        .ok()
+        .map(|scale| scale.0)
+        .unwrap_or(1.0);
+    let attached = state
+        .world
+        .get::<&AttachedBufferDimensions>(surface_entity)
+        .ok()
+        .and_then(|attached| attached.0);
+    let rounded_scale = surface_scale.round();
+    let integer_scale = if rounded_scale > 1.0 && (surface_scale - rounded_scale).abs() < 0.01 {
+        rounded_scale as i32
+    } else {
+        1
+    };
+
+    let target_scale = attached
+        .filter(|buffer| {
+            let threshold = DEFAULT_CURSOR_BASE_SIZE.saturating_mul(integer_scale.max(1));
+            integer_scale > 1 && (buffer.width >= threshold || buffer.height >= threshold)
+        })
+        .map(|_| integer_scale)
+        .unwrap_or(1);
+
+    (target_scale, attached)
+}
+
+fn div_ceil_i32(value: i32, divisor: i32) -> i32 {
+    (value + divisor - 1) / divisor
+}
+
+fn desired_cursor_viewport_destination(
+    attached: Option<BufferDimensions>,
+    buffer_scale: i32,
+) -> Option<BufferDimensions> {
+    if buffer_scale > 1 {
+        if let Some(buffer) = attached {
+            return Some(BufferDimensions {
+                width: div_ceil_i32(buffer.width, buffer_scale),
+                height: div_ceil_i32(buffer.height, buffer_scale),
+            });
+        }
+    }
+
+    None
+}
+
+fn maybe_forward_cursor_surface<S: X11Selection>(
+    state: &mut InnerServerState<S>,
+    surface_entity: Entity,
+) {
+    let Some(CursorSurfaceOwner(owner)) = state
+        .world
+        .get::<&CursorSurfaceOwner>(surface_entity)
+        .ok()
+        .map(|owner| *owner)
+    else {
+        return;
+    };
+    let Some(cursor_state) = cursor_state(state, owner) else {
+        return;
+    };
+    if cursor_state.surface != Some(surface_entity) {
+        return;
+    }
+
+    let surface = {
+        let surface = state
+            .world
+            .get::<&client::wl_surface::WlSurface>(surface_entity)
+            .unwrap();
+        (*surface).clone()
+    };
+    let viewport = {
+        let viewport = state.world.get::<&WpViewport>(surface_entity).unwrap();
+        (*viewport).clone()
+    };
+    let (buffer_scale, attached) = desired_cursor_buffer_scale(state, surface_entity);
+    let viewport_destination = desired_cursor_viewport_destination(attached, buffer_scale);
+    surface.set_buffer_scale(buffer_scale);
+    if let Some(viewport_destination) = viewport_destination {
+        viewport.set_destination(viewport_destination.width, viewport_destination.height);
+    } else {
+        viewport.set_destination(-1, -1);
+    }
+
+    let (hotspot_x, hotspot_y) = if buffer_scale > 1 {
+        (
+            cursor_state.hotspot_x / buffer_scale,
+            cursor_state.hotspot_y / buffer_scale,
+        )
+    } else {
+        (cursor_state.hotspot_x, cursor_state.hotspot_y)
+    };
+
+    match owner {
+        CursorOwner::Pointer(entity) => {
+            let pointer = state
+                .world
+                .get::<&client::wl_pointer::WlPointer>(entity)
+                .unwrap()
+                .clone();
+            pointer.set_cursor(cursor_state.serial, Some(&surface), hotspot_x, hotspot_y);
+        }
+        CursorOwner::TabletTool(entity) => {
+            let tool = state
+                .world
+                .get::<&c_tablet::zwp_tablet_tool_v2::ZwpTabletToolV2>(entity)
+                .unwrap()
+                .clone();
+            tool.set_cursor(cursor_state.serial, Some(&surface), hotspot_x, hotspot_y);
+        }
+    }
+}
+
 // noop
 impl<S: X11Selection> Dispatch<WlCallback, ()> for InnerServerState<S> {
     fn request(
@@ -94,15 +268,29 @@ impl<S: X11Selection> Dispatch<WlSurface, Entity> for InnerServerState<S> {
         let mut role = data.get::<&mut SurfaceRole>();
         let xdg = role.as_ref().and_then(|role| role.xdg());
         let configured = xdg.is_none_or(|xdg| xdg.configured);
-        let client = data.get::<&client::wl_surface::WlSurface>().unwrap();
+        let client = {
+            let client = data.get::<&client::wl_surface::WlSurface>().unwrap();
+            (*client).clone()
+        };
 
         let mut cmd = CommandBuffer::new();
+        let mut should_commit = false;
 
         match request {
             Request::<WlSurface>::Attach { buffer, x, y } => {
                 if buffer.is_none() {
                     trace!("xwayland attached null buffer to {client:?}");
                 }
+                let attached_dimensions = buffer
+                    .as_ref()
+                    .and_then(|buffer| buffer.data().copied())
+                    .and_then(|entity| {
+                        state
+                            .world
+                            .get::<&BufferDimensions>(entity)
+                            .ok()
+                            .map(|buffer| *buffer)
+                    });
                 let buffer = buffer.as_ref().map(|b| {
                     let entity: Entity = b.data().copied().unwrap();
                     state
@@ -117,6 +305,7 @@ impl<S: X11Selection> Dispatch<WlSurface, Entity> for InnerServerState<S> {
                     let buffer = buffer.as_deref().cloned();
                     cmd.insert(*entity, (SurfaceAttach { buffer, x, y },));
                 }
+                cmd.insert(*entity, (AttachedBufferDimensions(attached_dimensions),));
             }
             Request::<WlSurface>::DamageBuffer {
                 x,
@@ -138,10 +327,25 @@ impl<S: X11Selection> Dispatch<WlSurface, Entity> for InnerServerState<S> {
             }
             Request::<WlSurface>::Commit => {
                 if configured {
-                    client.commit();
+                    should_commit = true;
                 }
             }
             Request::<WlSurface>::Destroy => {
+                let cursor_owner = state
+                    .world
+                    .get::<&CursorSurfaceOwner>(*entity)
+                    .ok()
+                    .map(|owner| owner.0);
+                if let Some(owner) = cursor_owner {
+                    let owner_entity = match owner {
+                        CursorOwner::Pointer(entity) | CursorOwner::TabletTool(entity) => entity,
+                    };
+                    if let Ok(mut cursor_state) = state.world.get::<&mut CursorState>(owner_entity) {
+                        if cursor_state.surface == Some(*entity) {
+                            cursor_state.surface = None;
+                        }
+                    }
+                }
                 if !data.has::<x::Window>() {
                     cmd.despawn(*entity);
                 }
@@ -176,8 +380,12 @@ impl<S: X11Selection> Dispatch<WlSurface, Entity> for InnerServerState<S> {
             other => warn!("unhandled surface request: {other:?}"),
         }
 
-        drop(client);
         drop(role);
+
+        if should_commit {
+            maybe_forward_cursor_surface(state, *entity);
+            client.commit();
+        }
 
         cmd.run_on(&mut state.world);
     }
@@ -303,7 +511,17 @@ impl<S: X11Selection> Dispatch<WlShmPool, client::wl_shm_pool::WlShmPool> for In
                     entity,
                 );
                 let server = data_init.init(id, entity);
-                state.world.spawn_at(entity, (client, server));
+                state.world.spawn_at(
+                    entity,
+                    (
+                        client,
+                        server,
+                        BufferDimensions {
+                            width,
+                            height,
+                        },
+                    ),
+                );
             }
             Request::<WlShmPool>::Resize { size } => {
                 c_pool.resize(size);
@@ -358,21 +576,25 @@ impl<S: X11Selection> Dispatch<WlPointer, Entity> for InnerServerState<S> {
                 hotspot_y,
                 surface,
             } => {
-                let c_pointer = state
-                    .world
-                    .get::<&client::wl_pointer::WlPointer>(*entity)
-                    .unwrap();
+                let surface = surface.and_then(|surface| surface.data().copied());
+                set_cursor_state(
+                    state,
+                    CursorOwner::Pointer(*entity),
+                    surface,
+                    serial,
+                    hotspot_x,
+                    hotspot_y,
+                );
 
-                let c_surface = surface.and_then(|s| {
-                    let e = s.data().copied()?;
-                    Some(
-                        state
-                            .world
-                            .get::<&client::wl_surface::WlSurface>(e)
-                            .unwrap(),
-                    )
-                });
-                c_pointer.set_cursor(serial, c_surface.as_deref(), hotspot_x, hotspot_y);
+                if let Some(surface) = surface {
+                    maybe_forward_cursor_surface(state, surface);
+                } else {
+                    state
+                        .world
+                        .get::<&client::wl_pointer::WlPointer>(*entity)
+                        .unwrap()
+                        .set_cursor(serial, None, hotspot_x, hotspot_y);
+                }
             }
             Request::<WlPointer>::Release => {
                 let (client, _) = state
@@ -634,7 +856,17 @@ impl<S: X11Selection>
                     entity,
                 );
                 let server = data_init.init(buffer_id, entity);
-                state.world.spawn_at(entity, (client, server));
+                state.world.spawn_at(
+                    entity,
+                    (
+                        client,
+                        server,
+                        BufferDimensions {
+                            width,
+                            height,
+                        },
+                    ),
+                );
             }
             Add {
                 fd,
@@ -728,7 +960,7 @@ impl<S: X11Selection> Dispatch<WlDrmServer, Entity> for InnerServerState<S> {
             &QueueHandle<MyWorld>,
         ) -> client::wl_buffer::WlBuffer;
 
-        let mut bufs: Option<(Box<DrmFn>, wayland_server::New<WlBuffer>)> = None;
+        let mut bufs: Option<(Box<DrmFn>, wayland_server::New<WlBuffer>, BufferDimensions)> = None;
         match request {
             CreateBuffer {
                 id,
@@ -743,6 +975,10 @@ impl<S: X11Selection> Dispatch<WlDrmServer, Entity> for InnerServerState<S> {
                         drm.create_buffer(name, width, height, stride, format, qh, key)
                     }),
                     id,
+                    BufferDimensions {
+                        width,
+                        height,
+                    },
                 ));
             }
             CreatePlanarBuffer {
@@ -766,6 +1002,10 @@ impl<S: X11Selection> Dispatch<WlDrmServer, Entity> for InnerServerState<S> {
                         )
                     }),
                     id,
+                    BufferDimensions {
+                        width,
+                        height,
+                    },
                 ));
             }
             CreatePrimeBuffer {
@@ -799,6 +1039,10 @@ impl<S: X11Selection> Dispatch<WlDrmServer, Entity> for InnerServerState<S> {
                         )
                     }),
                     id,
+                    BufferDimensions {
+                        width,
+                        height,
+                    },
                 ));
             }
             Authenticate { id } => {
@@ -811,7 +1055,7 @@ impl<S: X11Selection> Dispatch<WlDrmServer, Entity> for InnerServerState<S> {
             _ => unreachable!(),
         }
 
-        if let Some((buf_create, id)) = bufs {
+        if let Some((buf_create, id, dims)) = bufs {
             let new_entity = state.world.reserve_entity();
             let client = {
                 let drm_client = state
@@ -821,7 +1065,7 @@ impl<S: X11Selection> Dispatch<WlDrmServer, Entity> for InnerServerState<S> {
                 buf_create(&drm_client, new_entity, &state.qh)
             };
             let server = data_init.init(id, new_entity);
-            state.world.spawn_at(new_entity, (client, server));
+            state.world.spawn_at(new_entity, (client, server, dims));
         }
     }
 }
@@ -1136,10 +1380,13 @@ impl<S: X11Selection> Dispatch<s_tablet::zwp_tablet_tool_v2::ZwpTabletToolV2, En
         _: &DisplayHandle,
         _: &mut wayland_server::DataInit<'_, Self>,
     ) {
-        let client = state
-            .world
-            .get::<&c_tablet::zwp_tablet_tool_v2::ZwpTabletToolV2>(*entity)
-            .unwrap();
+        let client = {
+            let tool = state
+                .world
+                .get::<&c_tablet::zwp_tablet_tool_v2::ZwpTabletToolV2>(*entity)
+                .unwrap();
+            (*tool).clone()
+        };
         match request {
             s_tablet::zwp_tablet_tool_v2::Request::SetCursor {
                 serial,
@@ -1147,14 +1394,26 @@ impl<S: X11Selection> Dispatch<s_tablet::zwp_tablet_tool_v2::ZwpTabletToolV2, En
                 hotspot_x,
                 hotspot_y,
             } => {
-                let surf_key: Option<Entity> = surface.map(|s| s.data().copied().unwrap());
-                let c_surface = surf_key.map(|key| {
+                let surface = surface.and_then(|surface| surface.data().copied());
+                set_cursor_state(
+                    state,
+                    CursorOwner::TabletTool(*entity),
+                    surface,
+                    serial,
+                    hotspot_x,
+                    hotspot_y,
+                );
+                drop(client);
+
+                if let Some(surface) = surface {
+                    maybe_forward_cursor_surface(state, surface);
+                } else {
                     state
                         .world
-                        .get::<&client::wl_surface::WlSurface>(key)
+                        .get::<&c_tablet::zwp_tablet_tool_v2::ZwpTabletToolV2>(*entity)
                         .unwrap()
-                });
-                client.set_cursor(serial, c_surface.as_deref(), hotspot_x, hotspot_y);
+                        .set_cursor(serial, None, hotspot_x, hotspot_y);
+                }
             }
             s_tablet::zwp_tablet_tool_v2::Request::Destroy => {
                 client.destroy();

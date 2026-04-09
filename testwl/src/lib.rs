@@ -109,6 +109,7 @@ pub struct Viewport {
 pub struct SurfaceData {
     pub surface: WlSurface,
     pub buffer: Option<WlBuffer>,
+    pub buffer_scale: i32,
     pub last_damage: Option<BufferDamage>,
     pub role: Option<SurfaceRole>,
     pub last_enter_serial: Option<u32>,
@@ -253,9 +254,17 @@ pub struct LockedPointer {
     pub surface: SurfaceId,
     pub cursor_hint: Option<Vec2f>,
 }
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub struct CursorData {
+    pub surface: Option<SurfaceId>,
+    pub hotspot: Vec2,
+}
+
 struct PointerState {
     pointer: WlPointer,
     locked: Option<LockedPointer>,
+    cursor: CursorData,
 }
 
 struct State {
@@ -653,6 +662,11 @@ impl Server {
     #[track_caller]
     pub fn locked_pointer(&self) -> Option<&LockedPointer> {
         self.state.pointer.as_ref().unwrap().locked.as_ref()
+    }
+
+    #[track_caller]
+    pub fn cursor_data(&self) -> Option<&CursorData> {
+        self.state.pointer.as_ref().map(|pointer| &pointer.cursor)
     }
 
     #[track_caller]
@@ -1417,6 +1431,10 @@ impl Dispatch<WlSeat, ()> for State {
                 state.pointer = Some(PointerState {
                     pointer: data_init.init(id, ()),
                     locked: None,
+                    cursor: CursorData {
+                        surface: None,
+                        hotspot: Vec2::default(),
+                    },
                 });
             }
             wl_seat::Request::GetKeyboard { id } => {
@@ -1445,7 +1463,18 @@ impl Dispatch<WlPointer, ()> for State {
         _: &mut wayland_server::DataInit<'_, Self>,
     ) {
         match request {
-            wl_pointer::Request::SetCursor { surface, .. } => {
+            wl_pointer::Request::SetCursor {
+                surface,
+                hotspot_x,
+                hotspot_y,
+                ..
+            } => {
+                let pointer = state.pointer.as_mut().expect("No pointer created");
+                pointer.cursor.surface = surface.as_ref().map(SurfaceId::from);
+                pointer.cursor.hotspot = Vec2 {
+                    x: hotspot_x,
+                    y: hotspot_y,
+                };
                 if let Some(surface) = surface {
                     let data = state.surfaces.get_mut(&SurfaceId::from(&surface)).unwrap();
 
@@ -1948,6 +1977,7 @@ impl Dispatch<WlCompositor, ()> for State {
                     SurfaceData {
                         surface,
                         buffer: None,
+                        buffer_scale: 1,
                         last_damage: None,
                         role: None,
                         last_enter_serial: None,
@@ -2049,7 +2079,9 @@ impl Dispatch<WlSurface, ()> for State {
                 state.surfaces.remove(&id);
             }
             SetInputRegion { .. } => {}
-            SetBufferScale { .. } => {}
+            SetBufferScale { scale } => {
+                data.buffer_scale = scale;
+            }
             other => todo!("unhandled request {other:?}"),
         }
     }

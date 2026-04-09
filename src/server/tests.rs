@@ -120,6 +120,14 @@ struct Compositor {
 
 impl Compositor {
     fn create_surface(&self) -> (TestObject<WlBuffer>, TestObject<WlSurface>) {
+        self.create_surface_with_size(10, 10)
+    }
+
+    fn create_surface_with_size(
+        &self,
+        width: i32,
+        height: i32,
+    ) -> (TestObject<WlBuffer>, TestObject<WlSurface>) {
         let fd = unsafe { BorrowedFd::borrow_raw(0) };
         let pool = TestObject::<WlShmPool>::from_request(
             &self.shm.obj,
@@ -129,8 +137,8 @@ impl Compositor {
             &pool.obj,
             Req::<WlShmPool>::CreateBuffer {
                 offset: 0,
-                width: 10,
-                height: 10,
+                width,
+                height,
                 stride: 1,
                 format: WEnum::Value(Format::Xrgb8888A8),
             },
@@ -2836,6 +2844,120 @@ fn scaled_pointer_lock_position_hint() {
         lock_data.cursor_hint,
         Some(testwl::Vec2f { x: 50.0, y: 50.0 })
     );
+}
+
+#[test]
+fn large_pointer_cursor_buffer_scales_to_logical_size() {
+    let mut f = TestFixture::new_pre_connect(|testwl| {
+        testwl.enable_fractional_scale();
+    });
+    let comp = f.compositor();
+    let pointer =
+        TestObject::<WlPointer>::from_request(&comp.seat.obj, wl_seat::Request::GetPointer {});
+
+    let win = Window::new(1);
+    let (_, id) = f.create_toplevel(&comp, win);
+    f.testwl.move_pointer_to(id, 1.0, 1.0);
+    f.run();
+
+    let (_, cursor_surface) = comp.create_surface_with_size(64, 64);
+    f.run();
+    let cursor_id = f.check_new_surface();
+    let fractional = f
+        .testwl
+        .get_surface_data(cursor_id)
+        .and_then(|surface| surface.fractional.as_ref())
+        .expect("No fractional scale for cursor surface");
+    fractional.preferred_scale(240);
+    f.run();
+    f.run();
+
+    pointer
+        .send_request(Req::<WlPointer>::SetCursor {
+            serial: 24,
+            hotspot_x: 30,
+            hotspot_y: 32,
+            surface: Some(cursor_surface.obj.clone()),
+        })
+        .unwrap();
+    cursor_surface
+        .send_request(Req::<WlSurface>::Commit)
+        .unwrap();
+    f.run();
+    f.run();
+
+    let cursor = f.testwl.cursor_data().expect("Missing cursor data");
+    assert_eq!(cursor.surface, Some(cursor_id));
+    assert_eq!(cursor.hotspot, testwl::Vec2 { x: 15, y: 16 });
+
+    let surface = f
+        .testwl
+        .get_surface_data(cursor_id)
+        .expect("Missing cursor surface data");
+    assert_eq!(surface.buffer_scale, 2);
+    let viewport = surface
+        .viewport
+        .as_ref()
+        .expect("Missing cursor viewport data");
+    assert_eq!(viewport.width, 32);
+    assert_eq!(viewport.height, 32);
+}
+
+#[test]
+fn small_pointer_cursor_buffer_stays_unscaled() {
+    let mut f = TestFixture::new_pre_connect(|testwl| {
+        testwl.enable_fractional_scale();
+    });
+    let comp = f.compositor();
+    let pointer =
+        TestObject::<WlPointer>::from_request(&comp.seat.obj, wl_seat::Request::GetPointer {});
+
+    let win = Window::new(1);
+    let (_, id) = f.create_toplevel(&comp, win);
+    f.testwl.move_pointer_to(id, 1.0, 1.0);
+    f.run();
+
+    let (_, cursor_surface) = comp.create_surface_with_size(24, 24);
+    f.run();
+    let cursor_id = f.check_new_surface();
+    let fractional = f
+        .testwl
+        .get_surface_data(cursor_id)
+        .and_then(|surface| surface.fractional.as_ref())
+        .expect("No fractional scale for cursor surface");
+    fractional.preferred_scale(240);
+    f.run();
+    f.run();
+
+    pointer
+        .send_request(Req::<WlPointer>::SetCursor {
+            serial: 24,
+            hotspot_x: 5,
+            hotspot_y: 1,
+            surface: Some(cursor_surface.obj.clone()),
+        })
+        .unwrap();
+    cursor_surface
+        .send_request(Req::<WlSurface>::Commit)
+        .unwrap();
+    f.run();
+    f.run();
+
+    let cursor = f.testwl.cursor_data().expect("Missing cursor data");
+    assert_eq!(cursor.surface, Some(cursor_id));
+    assert_eq!(cursor.hotspot, testwl::Vec2 { x: 5, y: 1 });
+
+    let surface = f
+        .testwl
+        .get_surface_data(cursor_id)
+        .expect("Missing cursor surface data");
+    assert_eq!(surface.buffer_scale, 1);
+    let viewport = surface
+        .viewport
+        .as_ref()
+        .expect("Missing cursor viewport data");
+    assert_eq!(viewport.width, -1);
+    assert_eq!(viewport.height, -1);
 }
 
 #[test]
