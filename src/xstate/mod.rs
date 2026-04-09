@@ -647,7 +647,8 @@ impl XState {
         if let Some(class) = class.resolve()? {
             server_state.set_win_class(window, class);
         }
-        if let Some(hints) = size_hints.resolve()? {
+        let size_hints = size_hints.resolve()?;
+        if let Some(hints) = size_hints {
             server_state.set_size_hints(window, hints);
         }
         let wmhints = wm_hints.resolve()?;
@@ -667,8 +668,13 @@ impl XState {
             .resolve()?
             .flatten();
 
-        let is_popup =
-            self.guess_is_popup(window, motif_hints, wmhints, transient_for.is_some())?;
+        let is_popup = self.guess_is_popup(
+            window,
+            motif_hints,
+            wmhints,
+            transient_for.is_some(),
+            size_hints,
+        )?;
         server_state.set_popup(window, is_popup);
         if let Some(parent) = transient_for.and_then(|t| (!is_popup).then_some(t)) {
             server_state.set_transient_for(window, parent);
@@ -698,10 +704,15 @@ impl XState {
         motif_hints: Option<motif::Hints>,
         wm_hints: Option<WmHints>,
         has_transient_for: bool,
+        size_hints: Option<WmNormalHints>,
     ) -> XResult<bool> {
         let mut motif_popup = false;
         let mut wmhint_popup = false;
         let mut has_skip_taskbar = None;
+        let has_fixed_size = size_hints
+            .as_ref()
+            .and_then(|hints| hints.min_size.zip(hints.max_size))
+            .is_some_and(|(min, max)| min == max);
 
         let attrs = self
             .connection
@@ -746,8 +757,6 @@ impl XState {
         }
 
         let override_redirect = self.connection.wait_for_reply(attrs)?.override_redirect();
-        let mut is_popup = override_redirect;
-
         let window_types = window_types.resolve()?.unwrap_or_else(|| {
             if !override_redirect && has_transient_for {
                 vec![self.window_atoms.dialog]
@@ -767,40 +776,15 @@ impl XState {
         }
         debug!("{window:?} override_redirect: {override_redirect:?}");
 
-        let mut known_window_type = false;
-        for ty in window_types {
-            match ty {
-                x if x == self.window_atoms.normal => is_popup = override_redirect || wmhint_popup,
-                x if x == self.window_atoms.dialog => is_popup = override_redirect,
-                x if x == self.window_atoms.utility => is_popup = override_redirect || motif_popup,
-                x if [
-                    self.window_atoms.menu,
-                    self.window_atoms.popup_menu,
-                    self.window_atoms.dropdown_menu,
-                    self.window_atoms.tooltip,
-                    self.window_atoms.drag_n_drop,
-                    self.window_atoms.combo,
-                ]
-                .contains(&x) =>
-                {
-                    is_popup = true;
-                }
-                _ => {
-                    continue;
-                }
-            }
-
-            known_window_type = true;
-            break;
-        }
-
-        if !known_window_type {
-            if let Some(has_skip_taskbar) = has_skip_taskbar {
-                is_popup = has_skip_taskbar || override_redirect;
-            }
-        }
-
-        Ok(is_popup)
+        Ok(determine_is_popup(
+            &self.window_atoms,
+            &window_types,
+            override_redirect,
+            wmhint_popup,
+            motif_popup,
+            has_skip_taskbar,
+            has_fixed_size,
+        ))
     }
 
     fn get_property_cookie(
@@ -1074,6 +1058,7 @@ xcb::atoms_struct! {
         ty => b"_NET_WM_WINDOW_TYPE" only_if_exists = false,
         normal => b"_NET_WM_WINDOW_TYPE_NORMAL" only_if_exists = false,
         dialog => b"_NET_WM_WINDOW_TYPE_DIALOG" only_if_exists = false,
+        kde_override => b"_KDE_NET_WM_WINDOW_TYPE_OVERRIDE" only_if_exists = false,
         drag_n_drop => b"_NET_WM_WINDOW_TYPE_DND" only_if_exists = false,
         splash => b"_NET_WM_WINDOW_TYPE_SPLASH" only_if_exists = false,
         menu => b"_NET_WM_WINDOW_TYPE_MENU" only_if_exists = false,
@@ -1082,6 +1067,193 @@ xcb::atoms_struct! {
         utility => b"_NET_WM_WINDOW_TYPE_UTILITY" only_if_exists = false,
         tooltip => b"_NET_WM_WINDOW_TYPE_TOOLTIP" only_if_exists = false,
         combo => b"_NET_WM_WINDOW_TYPE_COMBO" only_if_exists = false,
+    }
+}
+
+fn determine_is_popup(
+    window_atoms: &WindowTypes,
+    window_types: &[x::Atom],
+    override_redirect: bool,
+    wmhint_popup: bool,
+    motif_popup: bool,
+    has_skip_taskbar: Option<bool>,
+    has_fixed_size: bool,
+) -> bool {
+    let has_normal_type = window_types.contains(&window_atoms.normal);
+    let has_kde_override_type = window_types.contains(&window_atoms.kde_override);
+    let only_normal_and_kde_override = has_normal_type
+        && has_kde_override_type
+        && window_types
+            .iter()
+            .copied()
+            .all(|ty| ty == window_atoms.normal || ty == window_atoms.kde_override);
+    if only_normal_and_kde_override && has_fixed_size {
+        return true;
+    }
+
+    let has_explicit_toplevel_type = window_types.iter().copied().any(|ty| {
+        ty == window_atoms.normal || ty == window_atoms.dialog || ty == window_atoms.utility
+    });
+    let known_window_type = |ty| match ty {
+        x if x == window_atoms.normal => true,
+        x if x == window_atoms.dialog => true,
+        x if x == window_atoms.utility => true,
+        x if x == window_atoms.kde_override => !has_explicit_toplevel_type,
+        x if [
+            window_atoms.menu,
+            window_atoms.popup_menu,
+            window_atoms.dropdown_menu,
+            window_atoms.tooltip,
+            window_atoms.drag_n_drop,
+            window_atoms.combo,
+        ]
+        .contains(&x) =>
+        {
+            true
+        }
+        _ => false,
+    };
+    for ty in window_types {
+        let is_popup = match *ty {
+            x if x == window_atoms.normal => override_redirect || wmhint_popup,
+            x if x == window_atoms.dialog => override_redirect,
+            x if x == window_atoms.utility => override_redirect || motif_popup,
+            x if x == window_atoms.kde_override && has_explicit_toplevel_type => continue,
+            x if [
+                window_atoms.kde_override,
+                window_atoms.menu,
+                window_atoms.popup_menu,
+                window_atoms.dropdown_menu,
+                window_atoms.tooltip,
+                window_atoms.drag_n_drop,
+                window_atoms.combo,
+            ]
+            .contains(&x) =>
+            {
+                true
+            }
+            _ => continue,
+        };
+
+        return is_popup;
+    }
+
+    if !window_types.iter().copied().any(known_window_type) {
+        if let Some(has_skip_taskbar) = has_skip_taskbar {
+            return has_skip_taskbar || override_redirect;
+        }
+    }
+
+    override_redirect
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_window_types() -> WindowTypes {
+        WindowTypes {
+            ty: x::Atom::new(1),
+            normal: x::Atom::new(2),
+            dialog: x::Atom::new(3),
+            kde_override: x::Atom::new(4),
+            drag_n_drop: x::Atom::new(5),
+            splash: x::Atom::new(6),
+            menu: x::Atom::new(7),
+            popup_menu: x::Atom::new(8),
+            dropdown_menu: x::Atom::new(9),
+            utility: x::Atom::new(10),
+            tooltip: x::Atom::new(11),
+            combo: x::Atom::new(12),
+        }
+    }
+
+    #[test]
+    fn kde_override_window_type_is_treated_as_popup_without_toplevel_type() {
+        let atoms = test_window_types();
+        assert!(determine_is_popup(
+            &atoms,
+            &[atoms.kde_override],
+            false,
+            false,
+            false,
+            Some(false),
+            false,
+        ));
+    }
+
+    #[test]
+    fn normal_window_type_stays_toplevel() {
+        let atoms = test_window_types();
+        assert!(!determine_is_popup(
+            &atoms,
+            &[atoms.normal],
+            false,
+            false,
+            false,
+            Some(false),
+            false,
+        ));
+    }
+
+    #[test]
+    fn kde_override_window_type_yields_to_normal_type() {
+        let atoms = test_window_types();
+        assert!(!determine_is_popup(
+            &atoms,
+            &[atoms.kde_override, atoms.normal],
+            false,
+            false,
+            false,
+            Some(false),
+            false,
+        ));
+        assert!(!determine_is_popup(
+            &atoms,
+            &[atoms.normal, atoms.kde_override],
+            false,
+            false,
+            false,
+            Some(false),
+            false,
+        ));
+    }
+
+    #[test]
+    fn fixed_size_kde_override_normal_window_is_treated_as_popup() {
+        let atoms = test_window_types();
+        assert!(determine_is_popup(
+            &atoms,
+            &[atoms.kde_override, atoms.normal],
+            false,
+            false,
+            false,
+            Some(false),
+            true,
+        ));
+        assert!(determine_is_popup(
+            &atoms,
+            &[atoms.normal, atoms.kde_override],
+            false,
+            false,
+            false,
+            Some(false),
+            true,
+        ));
+    }
+
+    #[test]
+    fn kde_override_window_type_yields_to_dialog_type() {
+        let atoms = test_window_types();
+        assert!(!determine_is_popup(
+            &atoms,
+            &[atoms.kde_override, atoms.dialog],
+            false,
+            false,
+            false,
+            Some(false),
+            false,
+        ));
     }
 }
 
