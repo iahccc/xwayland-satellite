@@ -211,17 +211,6 @@ impl XState {
                     | SelectionEventMask::SELECTION_CLIENT_CLOSE,
             })
             .unwrap();
-        {
-            // Setup default cursor theme
-            let ctx = CursorContext::new(&connection, screen).unwrap();
-            let left_ptr = ctx.load_cursor(Cursor::LeftPtr);
-            connection
-                .send_and_check_request(&x::ChangeWindowAttributes {
-                    window: root,
-                    value_list: &[x::Cw::Cursor(left_ptr)],
-                })
-                .unwrap();
-        }
 
         let wm_window = connection.generate_id();
         let selection_state = SelectionState::new(&connection, root, &atoms);
@@ -241,6 +230,7 @@ impl XState {
             settings,
             max_req_bytes,
         };
+        r.reload_default_cursor();
         r.create_ewmh_window();
         r.set_xsettings_owner();
         r
@@ -271,6 +261,22 @@ impl XState {
                 property,
                 r#type,
                 data,
+            })
+            .unwrap();
+    }
+
+    fn reload_default_cursor(&self) {
+        let screen = self.connection.get_setup().roots().next().unwrap();
+        let Some(ctx) = CursorContext::new(&self.connection, screen) else {
+            warn!("Couldn't reload default cursor theme");
+            return;
+        };
+
+        let left_ptr = ctx.load_cursor(Cursor::LeftPtr);
+        self.connection
+            .send_and_check_request(&x::ChangeWindowAttributes {
+                window: self.root,
+                value_list: &[x::Cw::Cursor(left_ptr)],
             })
             .unwrap();
     }
